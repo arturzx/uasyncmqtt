@@ -1,7 +1,7 @@
 import asyncio
 
 import time
-from contextlib import suppress
+
 
 DEFAULT_PORT = 1883
 DEFAULT_SSL_PORT = 8883
@@ -109,6 +109,7 @@ class MQTTClient:
         self._keep_alive = keep_alive
         self._last_will: MQTTMessage | None = last_will
         self._queue = MQTTMessageQueue(queue_size)
+        self._connected: bool = False
         self._connected_events: list[asyncio.Event] = []
         self._disconnected_events: list[asyncio.Event] = []
         self._reader = None
@@ -122,10 +123,14 @@ class MQTTClient:
         self._last_received_message_timestamp = None
         self._last_ping_response_message_timestamp = None
 
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
     def create_connected_event(self) -> asyncio.Event:
         event = asyncio.Event()
         self._connected_events.append(event)
-        return event
+        return self._create_event(self._connected_events)
 
     def remove_connected_event(self, event: asyncio.Event):
         try:
@@ -136,7 +141,7 @@ class MQTTClient:
     def create_disconnected_event(self) -> asyncio.Event:
         event = asyncio.Event()
         self._disconnected_events.append(event)
-        return event
+        return self._create_event(self._disconnected_events)
 
     def remove_disconnected_event(self, event: asyncio.Event):
         try:
@@ -155,14 +160,18 @@ class MQTTClient:
         if self._connection_supervisor_task is None:
             raise MQTTException('Not connected')
         self._connection_supervisor_task.cancel()
-        with suppress(asyncio.CancelledError):
+        try:
             await self._connection_supervisor_task
+        except asyncio.CancelledError:
+            pass
         self._connection_supervisor_task = None
         if self._writer is not None:
             await self._send_message(14)
             await self._disconnect()
 
     async def publish(self, topic: str, payload: bytes, retain: bool = False, qos: int = 0):
+        if self._connected is False:
+            raise MQTTException('Not connected')
         await self._send_message(
             3,
             None,
@@ -188,6 +197,8 @@ class MQTTClient:
             qos: int = 0
     ) -> int | tuple[tuple[str, int]]:
         assert 0 <= qos <= 2
+        if self._connected is False:
+            raise MQTTException('Not connected')
         continuation_length = 2
         if isinstance(topic_or_topics, str):
             continuation_length += 2 + len(topic_or_topics) + 1
@@ -235,7 +246,14 @@ class MQTTClient:
     async def __anext__(self):
         return await self._queue.__anext__()
 
+    @staticmethod
+    def _create_event(events_list: list[asyncio.Event]):
+        event = asyncio.Event()
+        events_list.append(event)
+        return event
+
     async def _connect(self, clean_session: bool = False):
+        self._connected = False
         self._message_id = 0
         self._response_events.clear()
         self._responses.clear()
@@ -292,19 +310,23 @@ class MQTTClient:
             raise MQTTConnectionRefusedException(response_payload[0x01])
         self._last_sent_message_timestamp = time.time()
         self._message_receiver_task = asyncio.create_task(self._message_receiver())
+        self._connected = True
         for event in self._connected_events:
             event.set()
 
     async def _disconnect(self):
         self._message_receiver_task.cancel()
-        with suppress(asyncio.CancelledError):
+        try:
             await self._message_receiver_task
+        except asyncio.CancelledError:
+            pass
         self._message_receiver_task = None
         self._writer.close()
         # TODO add wait_for?
         await self._writer.wait_closed()
         self._writer = None
         self._reader = None
+        self._connected = False
         for event in self._disconnected_events:
             event.set()
 
@@ -354,29 +376,29 @@ class MQTTClient:
         n = 0
         shift = 0
         while True:
-            try:
-                b = await self._reader.readexactly(1)
-            except asyncio.IncompleteReadError:
+            b = await self._reader.read(1)
+            if len(b) == 0:
                 raise MQTTConnectionInterrupted
             n |= (b[0] & 0x7F) << shift
             if not b[0] & 0x80:
                 return n
             shift += 7
 
-    async def _receive_message(self) -> tuple[int, bool, int, bool, bytes]:
-        try:
-            b = await self._reader.readexactly(1)
-        except asyncio.IncompleteReadError:
+    async def _receive_message(self) -> tuple[int, bool, int, bool, bytes | None]:
+        b = await self._reader.read(1)
+        if len(b) == 0:
             raise MQTTConnectionInterrupted
         type_ = b[0] >> 4
         dup = bool(b[0] & 0x08)
         qos = (b[0] >> 1) & 0x3
         retain = bool(b[0] & 0x01)
         length = await self._receive_length()
-        try:
-            payload = await self._reader.readexactly(length)
-        except asyncio.IncompleteReadError:
-            raise MQTTConnectionInterrupted
+        if length > 0:
+            payload = await self._reader.read(length)
+            if len(payload) != length:
+                raise MQTTConnectionInterrupted
+        else:
+            payload = None
         self._last_received_message_timestamp = time.time()
         return type_, dup, qos, retain, payload
 
@@ -418,10 +440,10 @@ class MQTTClient:
         while True:
             try:
                 if self._writer is None:
+                    # TODO add exponential backoff?
                     try:
                         await self._connect(first_connect)
                     except MQTTConnectionError:
-                        # TODO add exponential backoff?
                         await asyncio.sleep(5.0)
                 else:
                     first_connect = False
